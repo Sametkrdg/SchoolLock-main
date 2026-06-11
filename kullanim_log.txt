@@ -1,0 +1,5 @@
+=== SCHOOLLOCK UYGULAMA KULLANIM RAPORU ===
+Son guncelleme: 2026-06-10 13:16:26
+---------------------------------------------
+SchoolLock  ->  0 dk 15 sn
+school_lock.py - SchoolLock - Visual Studio Code  ->  0 dk 10 sn
