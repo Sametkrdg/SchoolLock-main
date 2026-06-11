@@ -1,6 +1,6 @@
 """
-TahtaKilit — Akıllı Tahta Güvenlik Uygulaması  |  Faz 1: Kiosk Arayüzü
-=======================================================================
+TahtaKilit — Akıllı Tahta Güvenlik Uygulaması  |  Faz 1 + 2: Kiosk GUI + IPC İstemcisi
+========================================================================================
 
 Tasarım felsefesi: "Ciddi, Güvenli, Basit" (Serious, Secure, Simple)
 
@@ -8,13 +8,24 @@ Tasarım felsefesi: "Ciddi, Güvenli, Basit" (Serious, Secure, Simple)
   • LockScreen      — Koyu/Crimson, kamera çerçevesi, kimlik doğrulama bekleniyor
   • DashboardScreen — Emerald, "Oturumu Kapat" butonu, öğretim modu
 
-Gelecek fazlara bağlantı noktaları (arama: "HOOK"):
-  • BIOMETRIC_HOOK  (Faz 3) — biometric.py, kamera karesi ve AUTH sinyalini buraya bağlar
-  • IPC_HOOK        (Faz 2) — watchdog.py Named Pipe istemcisi buraya eklenir
+Faz bağlantı noktaları (arama: "HOOK"):
+  • IPC_HOOK        (Faz 2) — IPCClient watchdog pipe'ına bağlanır ✓ (bu dosyada)
+  • BIOMETRIC_HOOK  (Faz 3) — biometric.py kamera karesi ve AUTH sinyalini buraya bağlar
 """
 
+import threading
+import time
 import tkinter as tk
 from tkinter import font as tkfont
+
+# pywin32 yalnızca Windows'ta zorunlu; kurulu değilse IPC sessizce devre dışı kalır.
+try:
+    import pywintypes
+    import win32con
+    import win32file
+    _IPC_AVAILABLE = True
+except ImportError:
+    _IPC_AVAILABLE = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,18 +123,11 @@ class TahtaKilitApp(tk.Tk):
         # Her zaman KİLİTLİ durumda başla.
         self.show_screen("LockScreen")
 
-        # ── IPC HOOK (Faz 2) ──────────────────────────────────────────────────
-        # Watchdog Named Pipe istemcisini buraya ekleyin.
-        # Bağlantı kurulduktan sonra aşağıdaki after() döngüsünü başlatın:
-        #
-        #   self.after(5000, self._send_heartbeat)
-        #
-        # def _send_heartbeat(self):
-        #     ipc.send("HEARTBEAT")
-        #     self.after(5000, self._send_heartbeat)
-        #
-        # authenticate_success() içinden ipc.send("AUTH_SUCCESS") gönderin.
-        # lock_system() içinden    ipc.send("LOCK_COMMAND")    gönderin.
+        # ── IPC HOOK (Faz 2) ─────────────────────────────────────────────────
+        # IPCClient arka planda bağlanır; bağlantı yoksa (watchdog çalışmıyor
+        # ya da pywin32 kurulu değil) uygulama sessizce devam eder.
+        self._ipc = IPCClient()
+        self._ipc.start()
         # ─────────────────────────────────────────────────────────────────────
 
     # ── GÜVENLİK ÖNLEMLER ────────────────────────────────────────────────────
@@ -183,18 +187,14 @@ class TahtaKilitApp(tk.Tk):
     def authenticate_success(self):
         """
         Başarılı kimlik doğrulama → Öğretim Kontrol Paneline geç.
-
         Faz 3'te biometric.py bu yöntemi çağırır.
-        Faz 2'de buraya ipc.send("AUTH_SUCCESS") eklenecek.
         """
+        self._ipc.send("AUTH_SUCCESS")
         self.show_screen("DashboardScreen")
 
     def lock_system(self):
-        """
-        Oturumu kapat → sistemi güvenli şekilde tekrar kilitle.
-
-        Faz 2'de buraya ipc.send("LOCK_COMMAND") eklenecek.
-        """
+        """Oturumu kapat → sistemi güvenli şekilde tekrar kilitle."""
+        self._ipc.send("LOCK_COMMAND")
         self.show_screen("LockScreen")
 
 
@@ -351,6 +351,127 @@ class DashboardScreen(tk.Frame):
             pady=Theme.PAD_LG,
             command=controller.lock_system,
         ).pack(pady=(0, Theme.PAD_LG), ipadx=Theme.PAD_LG, ipady=Theme.PAD_MD)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IPC İSTEMCİSİ  —  Watchdog Named Pipe'ına bağlanır
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IPCClient:
+    """
+    Watchdog Named Pipe sunucusuna bağlanan hafif istemci.
+
+    Tasarım kararları:
+      • Tüm ağ/pipe işlemleri daemon thread'de çalışır — Tkinter ana döngüsünü
+        hiçbir zaman bloklamaz.
+      • Watchdog çalışmıyorsa (geliştirme ortamı, DEV_MODE) bağlantı sessizce
+        başarısız olur; uygulama tek başına çalışmaya devam eder.
+      • send() thread-safe; authenticate_success() ve lock_system() doğrudan çağırır.
+    """
+
+    PIPE_NAME          = r"\\.\pipe\TahtaKilitIPC"
+    HEARTBEAT_INTERVAL = 2.0    # saniye
+    CONNECT_RETRIES    = 5
+    RETRY_DELAY_BASE   = 0.5    # üstel geri çekilme için taban (saniye)
+
+    def __init__(self) -> None:
+        self._handle   = None
+        self._lock     = threading.Lock()
+        self._running  = True
+
+    def start(self) -> None:
+        """Bağlantı + kalp atışı döngüsünü arka planda başlatır."""
+        if not _IPC_AVAILABLE:
+            # pywin32 kurulu değil — IPC devre dışı, uygulama yine çalışır.
+            return
+        t = threading.Thread(
+            target=self._connect_and_heartbeat,
+            daemon=True,
+            name="IPCClient",
+        )
+        t.start()
+
+    def send(self, message: str) -> bool:
+        """
+        Watchdog'a bir mesaj gönderir.
+        Bağlı değilse ya da gönderim başarısız olursa False döner —
+        çağıran taraf bu durumu ele almak zorunda değildir.
+        """
+        if not _IPC_AVAILABLE:
+            return False
+        with self._lock:
+            if self._handle is None:
+                return False
+            try:
+                win32file.WriteFile(self._handle, message.encode("utf-8"))
+                return True
+            except pywintypes.error:
+                # Pipe koptu — bağlantıyı temizle; _connect_and_heartbeat yeniden dener.
+                self._close_handle()
+                return False
+
+    # ── İÇ YARDIMCILAR ────────────────────────────────────────────────────────
+
+    def _connect_and_heartbeat(self) -> None:
+        """
+        Pipe'a bağlanmayı dener (üstel geri çekilmeyle) ve sonra
+        kalp atışı döngüsüne girer. Pipe koparsa yeniden bağlanmayı dener.
+        """
+        while self._running:
+            if self._handle is None:
+                if not self._try_connect():
+                    # Tüm denemeler tükendi — watchdog çalışmıyor olabilir.
+                    # Bir süre bekle, sonra tekrar dene (watchdog sonradan başlayabilir).
+                    time.sleep(self.RETRY_DELAY_BASE * self.CONNECT_RETRIES)
+                    continue
+
+            # Pipe bağlı: kalp atışı gönder.
+            if not self.send("HEARTBEAT"):
+                # send() bağlantıyı kapattı; döngünün başına dön ve yeniden bağlan.
+                continue
+
+            time.sleep(self.HEARTBEAT_INTERVAL)
+
+    def _try_connect(self) -> bool:
+        """
+        Pipe'a bağlanmayı CONNECT_RETRIES kez dener.
+        Başarılıysa True, tüm denemeler tükendiyse False döner.
+        """
+        for attempt in range(self.CONNECT_RETRIES):
+            try:
+                handle = win32file.CreateFile(
+                    self.PIPE_NAME,
+                    win32con.GENERIC_WRITE,   # Yalnızca GUI→Watchdog yönünde
+                    0,                        # Paylaşım yok
+                    None,                     # Güvenlik tanımlayıcısı
+                    win32con.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                with self._lock:
+                    self._handle = handle
+                return True
+
+            except pywintypes.error as exc:
+                # 2   = ERROR_FILE_NOT_FOUND  (pipe henüz oluşturulmadı)
+                # 231 = ERROR_PIPE_BUSY       (önceki istemci hâlâ bağlı)
+                delay = self.RETRY_DELAY_BASE * (attempt + 1)
+                if exc.winerror in (2, 231):
+                    time.sleep(delay)
+                else:
+                    # Beklenmedik hata — daha uzun bekle.
+                    time.sleep(delay * 2)
+
+        return False
+
+    def _close_handle(self) -> None:
+        """Pipe handle'ını güvenli şekilde kapatır (kilit altında)."""
+        if self._handle is not None:
+            try:
+                win32file.CloseHandle(self._handle)
+            except Exception:
+                pass
+            self._handle = None
 
 
 if __name__ == "__main__":
