@@ -1,16 +1,16 @@
 """
-TahtaKilit — Akıllı Tahta Güvenlik Uygulaması  |  Faz 1 + 2: Kiosk GUI + IPC İstemcisi
-========================================================================================
+TahtaKilit — Akıllı Tahta Güvenlik Uygulaması  |  Faz 1 + 2 + 3: Tam MVP
+==========================================================================
 
 Tasarım felsefesi: "Ciddi, Güvenli, Basit" (Serious, Secure, Simple)
 
 İki durumlu state-machine:
-  • LockScreen      — Koyu/Crimson, kamera çerçevesi, kimlik doğrulama bekleniyor
+  • LockScreen      — Koyu/Crimson, canlı kamera akışı, yüz tanıma bekleniyor
   • DashboardScreen — Emerald, "Oturumu Kapat" butonu, öğretim modu
 
-Faz bağlantı noktaları (arama: "HOOK"):
-  • IPC_HOOK        (Faz 2) — IPCClient watchdog pipe'ına bağlanır ✓ (bu dosyada)
-  • BIOMETRIC_HOOK  (Faz 3) — biometric.py kamera karesi ve AUTH sinyalini buraya bağlar
+Entegre modüller:
+  • IPCClient      (Faz 2) — Watchdog Named Pipe istemcisi ✓
+  • BiometricEngine (Faz 3) — Yüz tanıma motoru ✓
 """
 
 import threading
@@ -26,6 +26,14 @@ try:
     _IPC_AVAILABLE = True
 except ImportError:
     _IPC_AVAILABLE = False
+
+# Biyometrik motor — opencv/face_recognition kurulu değilse devre dışı kalır.
+try:
+    from src.gui.biometric import BiometricEngine
+    _BIOMETRIC_AVAILABLE = True
+except ImportError:
+    BiometricEngine      = None  # type: ignore[assignment,misc]
+    _BIOMETRIC_AVAILABLE = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,11 +131,25 @@ class TahtaKilitApp(tk.Tk):
         # Her zaman KİLİTLİ durumda başla.
         self.show_screen("LockScreen")
 
-        # ── IPC HOOK (Faz 2) ─────────────────────────────────────────────────
-        # IPCClient arka planda bağlanır; bağlantı yoksa (watchdog çalışmıyor
-        # ya da pywin32 kurulu değil) uygulama sessizce devam eder.
+        # ── IPC (Faz 2) ──────────────────────────────────────────────────────
+        # Watchdog pipe istemcisi; bağlanamadığında sessizce devam eder.
         self._ipc = IPCClient()
         self._ipc.start()
+
+        # ── BİYOMETRİK MOTOR (Faz 3) ─────────────────────────────────────────
+        # face_recognition / opencv kurulu değilse _bio = None kalır ve
+        # authenticate_success() / lock_system() güvenle çalışmaya devam eder.
+        lock_screen  = self.frames["LockScreen"]
+        if _BIOMETRIC_AVAILABLE:
+            self._bio: BiometricEngine | None = BiometricEngine(
+                camera_label = lock_screen.camera_label,
+                on_auth      = self.authenticate_success,
+                on_error     = lock_screen.update_status,
+                tk_root      = self,
+            )
+            self._bio.start()
+        else:
+            self._bio = None
         # ─────────────────────────────────────────────────────────────────────
 
     # ── GÜVENLİK ÖNLEMLER ────────────────────────────────────────────────────
@@ -195,6 +217,8 @@ class TahtaKilitApp(tk.Tk):
     def lock_system(self):
         """Oturumu kapat → sistemi güvenli şekilde tekrar kilitle."""
         self._ipc.send("LOCK_COMMAND")
+        if self._bio is not None:
+            self._bio.reset_on_lock()   # Anlık yeniden giriş cooldown'u uygula
         self.show_screen("LockScreen")
 
 
@@ -244,47 +268,43 @@ class LockScreen(tk.Frame):
         ).pack(pady=(0, Theme.PAD_LG))
 
         # ── KAMERA ÇERÇEVESİ ─────────────────────────────────────────────────
-        # Crimson kenarlı, içi saf siyah, sabit 720×480.
-        # BIOMETRIC HOOK (Faz 3): biometric.py bu çerçeveye kamera karesi yazar
-        # ve eşleşme onaylandığında controller.authenticate_success() çağırır.
-        # TEMP-AUTH-HOOK click binding'i o aşamada kaldırılacak.
+        # Crimson kenarlı, içi saf siyah, sabit 640×480 piksel.
+        # BiometricEngine her karede camera_label.config(image=...) ile günceller.
         camera_outer = tk.Frame(body, bg=Theme.CRIMSON, highlightthickness=0, bd=0)
         camera_outer.pack(pady=Theme.PAD_MD)
 
-        # camera_label: biometric.py tarafından her karede güncellenen widget.
-        self.camera_label = tk.Label(
-            camera_outer,
-            bg=Theme.BG_CAMERA,
-            width=720,
-            height=480,
-            cursor="hand2",
+        # pack_propagate(False): kamera başlamadan önce çerçevenin boyutunu korur.
+        camera_container = tk.Frame(
+            camera_outer, bg=Theme.BG_CAMERA, width=640, height=480
         )
-        self.camera_label.pack(padx=4, pady=4)
+        camera_container.pack(padx=4, pady=4)
+        camera_container.pack_propagate(False)
 
-        # Gerçek akış gelince kaldırılacak yer tutucu metin.
-        placeholder = tk.Label(
-            self.camera_label,
-            text="KAMERA GÖRÜNTÜSÜ\n\n[ OpenCV akışı buraya yerleştirilecek ]",
-            font=controller.font_body,
-            bg=Theme.BG_CAMERA,
-            fg=Theme.FG_MUTED,
-            justify="center",
-        )
-        placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        # camera_label: BiometricEngine'in yazdığı widget (dışarıya açık).
+        self.camera_label = tk.Label(camera_container, bg=Theme.BG_CAMERA)
+        self.camera_label.place(relx=0.5, rely=0.5, anchor="center")
 
-        # TEMP-AUTH-HOOK: kamera alanına tıklamak doğrulamayı simüle eder.
-        # Faz 3'te biometric.py bağlantısıyla bu satırlar kaldırılacak.
-        for widget in (self.camera_label, placeholder):
-            widget.bind("<Button-1>", lambda _e: controller.authenticate_success())
-
-        # Alt yardımcı metin
-        tk.Label(
+        # ── DURUM SATIRI ──────────────────────────────────────────────────────
+        # BiometricEngine update_status() aracılığıyla bu label'ı günceller:
+        #   "Doğrulanıyor... (3/5)"  → is_error=False, FG_MUTED
+        #   "Kamera bağlanamadı"     → is_error=True,  CRIMSON
+        self.status_label = tk.Label(
             body,
             text="Yüzünüzü kameraya hizalayın",
             font=controller.font_body,
             bg=Theme.BG_DARK,
             fg=Theme.FG_MUTED,
-        ).pack(pady=(Theme.PAD_MD, 0))
+        )
+        self.status_label.pack(pady=(Theme.PAD_MD, 0))
+
+
+    def update_status(self, text: str, is_error: bool = False) -> None:
+        """
+        BiometricEngine tarafından Tkinter ana thread'inde çağrılır.
+        Normal mesajlar gri, hata mesajları Crimson renkte gösterilir.
+        """
+        color = Theme.CRIMSON if is_error else Theme.FG_MUTED
+        self.status_label.config(text=text, fg=color)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

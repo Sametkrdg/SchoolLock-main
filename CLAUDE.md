@@ -85,21 +85,33 @@ Most of this does not exist yet — see **Current State** below.
 
 ## Current State of the Codebase
 
-Two proof-of-concept files exist at the root:
+### `app.py` — Full MVP GUI (Phase 1 + 2 + 3)
+- Two-state Tkinter fullscreen app: `LockScreen` ↔ `DashboardScreen`.
+- `Theme` class centralises all design tokens. Always use `Theme.*` constants rather than hardcoding values.
+- `DEV_MODE = True` flag: disables fullscreen, disables focus-stealing loop, enables `Shift+Escape` dev exit. Set to `False` before compiling.
+- `LockScreen.camera_label` (`tk.Label`) — the live camera feed target; `BiometricEngine` writes `ImageTk.PhotoImage` frames here.
+- `LockScreen.update_status(text, is_error)` — status text below the camera; `BiometricEngine` calls this for progress and error messages.
+- `IPCClient` (Faz 2) — daemon thread that connects to the watchdog Named Pipe and sends `HEARTBEAT` / `AUTH_SUCCESS` / `LOCK_COMMAND` signals.
+- `BiometricEngine` (Faz 3) started in `TahtaKilitApp.__init__`; gracefully absent if `opencv` / `face_recognition` are not installed.
 
-### `app.py` — UI prototype (Phase 1)
-- Two-state Tkinter fullscreen app: `LockScreen` ↔ `DashboardScreen`
-- The `Theme` class centralises all design tokens (colors, fonts, spacing). Always use `Theme.*` constants rather than hardcoding values.
-- The lock screen's camera frame is a placeholder. The line tagged `# TEMP-AUTH-HOOK` simulates a successful auth on click. **Replace this hook in Phase 2** with a real signal from `biometric.py`.
-- ESC exits fullscreen in dev mode. This binding must be removed before production.
+### `src/watchdog/watchdog.py` — Watchdog Process (Phase 2)
+- Starts as the Windows shell; launches `app.py` (DEV_MODE) or `KilitArayuzu.exe` as a child subprocess.
+- `process.wait()` blocks until the GUI dies — zero CPU polling, instant detection.
+- Relaunches within 50 ms (`RELAUNCH_COOLDOWN_S`). Crash-loop throttle after 5 quick relaunches.
+- Named Pipe server (`\\.\pipe\TahtaKilitIPC`) reads `HEARTBEAT`, `AUTH_SUCCESS`, `LOCK_COMMAND` from the GUI.
+- `REGISTRY_HOOK` comments mark where `registry_ops.RegistryEngine` calls will go.
 
-### `school_lock.py` — functional MVP demo
-- Uses OpenCV LBPH (not dlib) for face recognition against a single reference photo (`ogretmen.jpg`).
-- Requires `GEREKLI_ESLESME` (default 5) consecutive matching frames before unlocking.
-- Background thread (`log_dongusu`) samples the foreground window every `LOG_ARALIGI_SN` seconds and writes cumulative usage time to `kullanim_log.txt`.
-- Calls `os._exit(0)` in `guvenli_cikis` to kill the process cleanly including daemon threads.
+### `src/gui/biometric.py` — Biometric Engine (Phase 3)
+- `VectorStore`: encrypts 128D face vectors with a machine-specific XOR key (SHA-256 of MAC + hostname) and saves to `profiles/vectors.dat`. Raw images are deleted after enrolment.
+- `BiometricEngine`: daemon thread — downscales frames to 1/4, runs `face_recognition` (dlib ResNet-34), applies Laplacian variance liveness test, requires `CONSECUTIVE_MATCHES` (5) in a row before calling `on_auth()`. All Tkinter calls go through `tk_root.after(0, ...)`.
+- Camera reconnect loop: retries `RECONNECT_ATTEMPTS` (5) times with 2 s delay; on total failure shows error on `status_label` and retries every 10 s.
+- `lock_system()` calls `BiometricEngine.reset_on_lock()` which imposes a 2 s cooldown to prevent immediate re-authentication after manual lock.
 
-**Note:** `school_lock.py` uses OpenCV's lightweight LBPH recogniser. The production architecture (TECH_DESIGN.md Phase 3) upgrades this to `face_recognition` (dlib ResNet-34) for better accuracy under varying classroom lighting.
+**Enrol a teacher:**
+```bash
+python src/gui/biometric.py enroll "Ahmet Öğretmen" ogretmen.jpg
+# Source image is deleted; vector saved to profiles/vectors.dat
+```
 
 ---
 
